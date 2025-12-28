@@ -99,7 +99,81 @@ export class PlayerDO implements DurableObject {
       return new Response('OK');
     }
 
+    // Bot auto-accept route (no WebSocket needed)
+    if (url.pathname === '/bot-accept-route' && request.method === 'POST') {
+      const body = await request.json() as { routeId: string };
+      return this.handleBotAcceptRoute(body.routeId);
+    }
+
+    // Get pending route requests (for bots to check)
+    if (url.pathname === '/pending-routes' && request.method === 'GET') {
+      return this.getPendingRoutes();
+    }
+
+    // Get connected POIs (for bots to invest in)
+    if (url.pathname === '/connected-pois' && request.method === 'GET') {
+      return this.getConnectedPois();
+    }
+
+    // Bot POI investment (no WebSocket needed)
+    if (url.pathname === '/bot-invest-poi' && request.method === 'POST') {
+      const body = await request.json() as { poiId: string; amount: number };
+      return this.handleBotInvestPoi(body.poiId, body.amount);
+    }
+
     return new Response('Not found', { status: 404 });
+  }
+
+  private async handleBotInvestPoi(poiId: string, amount: number): Promise<Response> {
+    // Load player if needed
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+    if (!this.player) {
+      return new Response('Player not found', { status: 404 });
+    }
+
+    if (amount <= 0) {
+      return new Response('Investment amount must be positive', { status: 400 });
+    }
+
+    if (this.player.nits < amount) {
+      return new Response('Insufficient nits', { status: 400 });
+    }
+
+    // Deduct nits
+    this.player.nits -= amount;
+
+    // Track investment in player state
+    if (!this.player.poiInvestments) {
+      this.player.poiInvestments = {};
+    }
+    if (!this.player.poiInvestments[poiId]) {
+      this.player.poiInvestments[poiId] = 0;
+    }
+    this.player.poiInvestments[poiId] += amount;
+
+    // Add heat for investing
+    this.player.heat = Math.min(HEAT_MAX, this.player.heat + HEAT_POI_INVEST);
+
+    await this.state.storage.put('player', this.player);
+
+    // Send investment to POI
+    const poiDOId = this.env.INTERSECTION.idFromName(poiId);
+    const poiDO = this.env.INTERSECTION.get(poiDOId);
+
+    const response = await poiDO.fetch(new Request('http://internal/invest', {
+      method: 'POST',
+      body: JSON.stringify({ player: this.player.username, amount }),
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    if (response.ok) {
+      console.log('[BOT POI INVEST]', this.player.username, 'invested', amount, 'in', poiId);
+      return Response.json({ success: true, poiId, amount });
+    }
+
+    return new Response('Failed to invest in POI', { status: 500 });
   }
 
   private async handleBotCreate(playerState: PlayerState): Promise<Response> {
@@ -417,29 +491,44 @@ export class PlayerDO implements DurableObject {
   }
 
   private async checkForIntersections(newRoute: RouteState): Promise<void> {
-    // Get all existing routes
+    // Get all existing routes from ALL players we know about
+    // This is necessary because intersections can happen between routes
+    // owned by completely different players
     const allRouteIds = new Set<string>();
+    const checkedPlayers = new Set<string>();
 
-    // Collect route IDs from both players involved
-    const playerAId = this.env.PLAYER.idFromName(newRoute.playerA);
-    const playerBId = this.env.PLAYER.idFromName(newRoute.playerB);
+    // Start with the two players in this route
+    const playersToCheck = [newRoute.playerA, newRoute.playerB];
 
-    const [playerAResp, playerBResp] = await Promise.all([
-      this.env.PLAYER.get(playerAId).fetch(new Request('http://internal/state')),
-      this.env.PLAYER.get(playerBId).fetch(new Request('http://internal/state')),
-    ]);
-
-    if (playerAResp.ok) {
-      const playerA = await playerAResp.json() as PlayerState;
-      playerA.routes.forEach(r => allRouteIds.add(r));
+    // Also check LA bot players for comprehensive intersection detection
+    const LA_BOT_NAMES = ['dtla', 'ktown', 'silvlk', 'echopk', 'hlywod', 'venice', 'culver', 'bvrlyh'];
+    for (const botName of LA_BOT_NAMES) {
+      if (!playersToCheck.includes(botName)) {
+        playersToCheck.push(botName);
+      }
     }
-    if (playerBResp.ok) {
-      const playerB = await playerBResp.json() as PlayerState;
-      playerB.routes.forEach(r => allRouteIds.add(r));
+
+    // Collect routes from all these players
+    for (const playerName of playersToCheck) {
+      if (checkedPlayers.has(playerName)) continue;
+      checkedPlayers.add(playerName);
+
+      try {
+        const playerId = this.env.PLAYER.idFromName(playerName);
+        const playerDO = this.env.PLAYER.get(playerId);
+        const resp = await playerDO.fetch(new Request('http://internal/state'));
+        if (resp.ok) {
+          const player = await resp.json() as PlayerState;
+          player.routes.forEach(r => allRouteIds.add(r));
+        }
+      } catch {
+        // Player doesn't exist, skip
+      }
     }
 
     // Remove the new route from the set
     allRouteIds.delete(newRoute.id);
+    console.log('[DEBUG] Checking new route', newRoute.id, 'against', allRouteIds.size, 'existing routes');
 
     // Check each existing route for intersection
     for (const routeId of allRouteIds) {
@@ -451,6 +540,14 @@ export class PlayerDO implements DurableObject {
 
       const existingRoute = await routeResp.json() as RouteState;
 
+      // Skip routes that share an endpoint (they'd "intersect" at the common player)
+      if (newRoute.playerA === existingRoute.playerA ||
+          newRoute.playerA === existingRoute.playerB ||
+          newRoute.playerB === existingRoute.playerA ||
+          newRoute.playerB === existingRoute.playerB) {
+        continue;
+      }
+
       // Import line intersection check
       const { lineIntersection } = await import('../lib/geo');
 
@@ -460,6 +557,7 @@ export class PlayerDO implements DurableObject {
       );
 
       if (intersection) {
+        console.log('[POI CREATED] Intersection at', intersection, 'between', newRoute.id, 'and', existingRoute.id);
         // Create intersection DO
         const intersectionId = `poi-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         const intersectionDOId = this.env.INTERSECTION.idFromName(intersectionId);
@@ -489,7 +587,7 @@ export class PlayerDO implements DurableObject {
           headers: { 'Content-Type': 'application/json' },
         }));
 
-        // Notify all involved players
+        // Notify all involved players (and their bots if applicable)
         for (const player of players) {
           const playerId = this.env.PLAYER.idFromName(player);
           const playerDO = this.env.PLAYER.get(playerId);
@@ -499,6 +597,19 @@ export class PlayerDO implements DurableObject {
             body: JSON.stringify(poiState),
             headers: { 'Content-Type': 'application/json' },
           }));
+
+          // Also notify BotDO if this is a bot player
+          try {
+            const botId = this.env.BOT.idFromName(player);
+            const botDO = this.env.BOT.get(botId);
+            await botDO.fetch(new Request('http://internal/intersection-created', {
+              method: 'POST',
+              body: JSON.stringify(poiState),
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          } catch {
+            // Not a bot, ignore
+          }
         }
       }
     }
@@ -781,5 +892,128 @@ export class PlayerDO implements DurableObject {
     for (const ws of this.sessions) {
       this.send(ws, msg);
     }
+  }
+
+  // Bot-specific methods (no WebSocket needed)
+
+  private async handleBotAcceptRoute(routeId: string): Promise<Response> {
+    // Load pending requests if needed
+    if (this.pendingRouteRequests.size === 0) {
+      const storedRequests = await this.state.storage.get<[string, { from: string; routeId: string }][]>('pendingRequests');
+      if (storedRequests) {
+        this.pendingRouteRequests = new Map(storedRequests);
+      }
+    }
+
+    const request = this.pendingRouteRequests.get(routeId);
+    if (!request) {
+      return new Response('Route request not found', { status: 404 });
+    }
+
+    // Load player state if not loaded
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+    if (!this.player) {
+      return new Response('Player not found', { status: 404 });
+    }
+
+    // Get the requesting player's state
+    const fromId = this.env.PLAYER.idFromName(request.from);
+    const fromDO = this.env.PLAYER.get(fromId);
+    const fromStateResp = await fromDO.fetch(new Request('http://internal/state'));
+
+    if (!fromStateResp.ok) {
+      return new Response('Could not get requesting player state', { status: 500 });
+    }
+
+    const fromPlayer = await fromStateResp.json() as PlayerState;
+
+    // Create the route
+    const routeDOId = this.env.ROUTE.idFromName(routeId);
+    const routeDO = this.env.ROUTE.get(routeDOId);
+
+    const route: RouteState = {
+      id: routeId,
+      playerA: request.from,
+      playerB: this.player.username,
+      coordsA: fromPlayer.coordinates,
+      coordsB: this.player.coordinates,
+      capacity: 10,
+      status: 'active',
+      createdAt: Date.now(),
+    };
+
+    await routeDO.fetch(new Request('http://internal/create', {
+      method: 'POST',
+      body: JSON.stringify(route),
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    // Add route to this player
+    if (!this.player.routes) {
+      this.player.routes = [];
+    }
+    this.player.routes.push(routeId);
+    await this.state.storage.put('player', this.player);
+
+    // Notify the requesting player
+    await fromDO.fetch(new Request('http://internal/route-accepted', {
+      method: 'POST',
+      body: JSON.stringify({ routeId, route }),
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    // Remove from pending
+    this.pendingRouteRequests.delete(routeId);
+    await this.state.storage.put('pendingRequests', Array.from(this.pendingRouteRequests.entries()));
+
+    // Check for intersections
+    await this.checkForIntersections(route);
+
+    return Response.json({ status: 'accepted', route });
+  }
+
+  private async getPendingRoutes(): Promise<Response> {
+    // Load pending requests
+    if (this.pendingRouteRequests.size === 0) {
+      const storedRequests = await this.state.storage.get<[string, { from: string; routeId: string }][]>('pendingRequests');
+      if (storedRequests) {
+        this.pendingRouteRequests = new Map(storedRequests);
+      }
+    }
+
+    const pending = Array.from(this.pendingRouteRequests.values());
+    return Response.json(pending);
+  }
+
+  private async getConnectedPois(): Promise<Response> {
+    // Load player if needed
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+    if (!this.player) {
+      return Response.json([]);
+    }
+
+    // Get all POIs connected to player's routes
+    const poiIds: Set<string> = new Set();
+
+    for (const routeId of this.player.routes) {
+      const routeDOId = this.env.ROUTE.idFromName(routeId);
+      const routeDO = this.env.ROUTE.get(routeDOId);
+      const routeResp = await routeDO.fetch(new Request('http://internal/state'));
+
+      if (routeResp.ok) {
+        const route = await routeResp.json() as RouteState;
+        // Check if there are any intersections involving this route
+        // For now, we need to check all intersections that might involve this route
+        // This is a bit expensive - in a production system we'd track this differently
+      }
+    }
+
+    // For now, return the player's POI investments as the "known" POIs
+    // The intersection detection will add new POIs as routes form
+    return Response.json(Object.keys(this.player.poiInvestments || {}));
   }
 }

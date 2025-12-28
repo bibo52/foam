@@ -15,9 +15,5 @@ bindings = [
 ]
 
 [[migrations]]
-tag = "v1"
-new_classes = ["PlayerDO", "RouteDO", "IntersectionDO", "MarketDO"]
-
-[[migrations]]
-tag = "v2"
-new_classes = ["BotDO"]
+tag = "v3"
+new_sqlite_classes = ["PlayerDO", "RouteDO", "IntersectionDO", "MarketDO", "BotDO"]

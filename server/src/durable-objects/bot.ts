@@ -1,4 +1,4 @@
-import { BotConfig, PlayerState, IntersectionState, Env } from '../types';
+import { BotConfig, PlayerState, IntersectionState, Env, RouteState } from '../types';
 
 // LA area bot configurations
 const LA_BOTS: BotConfig[] = [
@@ -43,7 +43,23 @@ export class BotDO implements DurableObject {
       return new Response('OK');
     }
 
+    // Notification that an intersection/POI was created on our route
+    if (url.pathname === '/intersection-created' && request.method === 'POST') {
+      const intersection = await request.json() as IntersectionState;
+      return this.handleIntersectionCreated(intersection);
+    }
+
     return new Response('Not found', { status: 404 });
+  }
+
+  private async handleIntersectionCreated(intersection: IntersectionState): Promise<Response> {
+    // Track this POI as known
+    const knownPois = await this.state.storage.get<string[]>('knownPois') ?? [];
+    if (!knownPois.includes(intersection.id)) {
+      knownPois.push(intersection.id);
+      await this.state.storage.put('knownPois', knownPois);
+    }
+    return new Response('OK');
   }
 
   private async initialize(config: BotConfig): Promise<Response> {
@@ -134,10 +150,13 @@ export class BotDO implements DurableObject {
       playerState = await stateResp.json();
     }
 
+    const knownPois = await this.state.storage.get<string[]>('knownPois') ?? [];
+
     return Response.json({
       status: initialized ? 'active' : 'initializing',
       config,
       playerState,
+      knownPois,
     });
   }
 
@@ -162,6 +181,9 @@ export class BotDO implements DurableObject {
 
     const playerState = await stateResp.json() as PlayerState;
 
+    // First, check and accept any pending route requests (bots auto-accept)
+    await this.acceptPendingRoutes(playerDO);
+
     // Decide action based on behavior
     switch (this.config.behavior) {
       case 'passive':
@@ -176,6 +198,23 @@ export class BotDO implements DurableObject {
       case 'expansionist':
         await this.expansionistAction(playerState);
         break;
+    }
+  }
+
+  private async acceptPendingRoutes(playerDO: DurableObjectStub): Promise<void> {
+    // Get pending route requests
+    const pendingResp = await playerDO.fetch(new Request('http://internal/pending-routes'));
+    if (!pendingResp.ok) return;
+
+    const pending = await pendingResp.json() as { from: string; routeId: string }[];
+
+    // Accept all pending requests (bots are friendly)
+    for (const request of pending) {
+      await playerDO.fetch(new Request('http://internal/bot-accept-route', {
+        method: 'POST',
+        body: JSON.stringify({ routeId: request.routeId }),
+        headers: { 'Content-Type': 'application/json' },
+      }));
     }
   }
 
@@ -196,11 +235,13 @@ export class BotDO implements DurableObject {
     const investChance = this.config.aggression;
 
     if (Math.random() < investChance && state.nits > 50) {
-      // Find POIs we can invest in (from our poiInvestments or nearby)
-      const poiIds = Object.keys(state.poiInvestments);
+      // Find POIs we can invest in - get from stored known POIs or player investments
+      const knownPois = await this.state.storage.get<string[]>('knownPois') ?? [];
+      const investedPois = Object.keys(state.poiInvestments);
+      const allPois = [...new Set([...knownPois, ...investedPois])];
 
-      if (poiIds.length > 0) {
-        const targetPoi = poiIds[Math.floor(Math.random() * poiIds.length)];
+      if (allPois.length > 0) {
+        const targetPoi = allPois[Math.floor(Math.random() * allPois.length)];
         const investAmount = Math.floor(state.nits * 0.3 * this.config.aggression);
 
         if (investAmount > 0) {
@@ -258,9 +299,12 @@ export class BotDO implements DurableObject {
 
     // Also invest moderately in POIs
     if (state.nits > 40 && Math.random() < 0.3) {
-      const poiIds = Object.keys(state.poiInvestments);
-      if (poiIds.length > 0) {
-        const targetPoi = poiIds[Math.floor(Math.random() * poiIds.length)];
+      const knownPois = await this.state.storage.get<string[]>('knownPois') ?? [];
+      const investedPois = Object.keys(state.poiInvestments);
+      const allPois = [...new Set([...knownPois, ...investedPois])];
+
+      if (allPois.length > 0) {
+        const targetPoi = allPois[Math.floor(Math.random() * allPois.length)];
         await this.investInPoi(state.username, targetPoi, Math.floor(state.nits * 0.15));
       }
     }
@@ -304,27 +348,10 @@ export class BotDO implements DurableObject {
     const playerId = this.env.PLAYER.idFromName(username);
     const playerDO = this.env.PLAYER.get(playerId);
 
-    // Deduct nits first
-    await playerDO.fetch(new Request('http://internal/update-nits', {
+    // Use the dedicated bot-invest-poi endpoint which handles nits, investment tracking, and heat
+    await playerDO.fetch(new Request('http://internal/bot-invest-poi', {
       method: 'POST',
-      body: JSON.stringify({ delta: -amount, reason: 'poi investment' }),
-      headers: { 'Content-Type': 'application/json' },
-    }));
-
-    // Invest in POI
-    const poiDOId = this.env.INTERSECTION.idFromName(poiId);
-    const poiDO = this.env.INTERSECTION.get(poiDOId);
-
-    await poiDO.fetch(new Request('http://internal/invest', {
-      method: 'POST',
-      body: JSON.stringify({ player: username, amount }),
-      headers: { 'Content-Type': 'application/json' },
-    }));
-
-    // Add heat
-    await playerDO.fetch(new Request('http://internal/add-heat', {
-      method: 'POST',
-      body: JSON.stringify({ amount: 5, reason: 'poi investment' }),
+      body: JSON.stringify({ poiId, amount }),
       headers: { 'Content-Type': 'application/json' },
     }));
   }
