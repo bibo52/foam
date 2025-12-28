@@ -1,5 +1,21 @@
-import { PlayerState, ServerMessage, ClientMessage, RouteState, Env } from '../types';
+import { PlayerState, ServerMessage, ClientMessage, RouteState, IntersectionState, Env, VisiblePlayer } from '../types';
 import { getLocationFromRequest, getRegionFromRequest, randomizeWithinNeighborhood } from '../lib/geo';
+
+// Heat constants
+const HEAT_DECAY_PER_TICK = 1;
+const HEAT_MAX = 100;
+const HEAT_MIN = 0;
+const HEAT_POI_INVEST = 5;
+const HEAT_POI_WIN = 10;
+const HEAT_TRADE = 2;
+const HEAT_ATTACK = 15;
+const HEAT_ROUTE_UPGRADE = 3;
+
+// Production bonus from controlled POIs
+const POI_PRODUCTION_BONUS = 0.5;
+
+// Tick interval in milliseconds
+const TICK_INTERVAL = 10000;
 
 export class PlayerDO implements DurableObject {
   private state: DurableObjectState;
@@ -8,6 +24,7 @@ export class PlayerDO implements DurableObject {
   private player: PlayerState | null = null;
   private pendingRouteRequests: Map<string, { from: string; routeId: string }> = new Map();
   private lastRequest: Request | null = null;
+  private controlledPois: string[] = []; // POI IDs this player controls
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -40,7 +57,65 @@ export class PlayerDO implements DurableObject {
       return this.handleRouteAcceptedNotification(body.routeId, body.route);
     }
 
+    // Update nits (called by market when trade fills)
+    if (url.pathname === '/update-nits' && request.method === 'POST') {
+      const body = await request.json() as { delta: number; reason: string };
+      return this.handleUpdateNits(body.delta, body.reason);
+    }
+
+    // Add heat (called by various systems)
+    if (url.pathname === '/add-heat' && request.method === 'POST') {
+      const body = await request.json() as { amount: number; reason: string };
+      return this.handleAddHeat(body.amount, body.reason);
+    }
+
+    // POI control changed
+    if (url.pathname === '/poi-control-changed' && request.method === 'POST') {
+      const body = await request.json() as { poiId: string; isController: boolean };
+      return this.handlePoiControlChanged(body.poiId, body.isController);
+    }
+
+    // Toll received from POI
+    if (url.pathname === '/toll-received' && request.method === 'POST') {
+      const body = await request.json() as { amount: number; fromPoi: string };
+      return this.handleTollReceived(body.amount, body.fromPoi);
+    }
+
+    // Get visible players for fog of war
+    if (url.pathname === '/visibility-info' && request.method === 'GET') {
+      return this.getVisibilityInfo();
+    }
+
+    // Bot initialization (create player without WebSocket)
+    if (url.pathname === '/bot-create' && request.method === 'POST') {
+      const playerState = await request.json() as PlayerState;
+      return this.handleBotCreate(playerState);
+    }
+
+    // Intersection created notification
+    if (url.pathname === '/intersection-created' && request.method === 'POST') {
+      const intersection = await request.json() as IntersectionState;
+      this.broadcast({ type: 'intersection_created', intersection });
+      return new Response('OK');
+    }
+
     return new Response('Not found', { status: 404 });
+  }
+
+  private async handleBotCreate(playerState: PlayerState): Promise<Response> {
+    // Only create if player doesn't exist
+    const existing = await this.state.storage.get<PlayerState>('player');
+    if (existing) {
+      return Response.json(existing);
+    }
+
+    this.player = playerState;
+    await this.state.storage.put('player', this.player);
+
+    // Start production alarm
+    await this.state.storage.setAlarm(Date.now() + TICK_INTERVAL);
+
+    return Response.json(this.player);
   }
 
   private async handleWebSocket(request: Request): Promise<Response> {
@@ -64,10 +139,13 @@ export class PlayerDO implements DurableObject {
 
     // Load player state
     this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    this.controlledPois = await this.state.storage.get<string[]>('controlledPois') ?? [];
 
-    // Ensure routes array exists (backwards compatibility)
-    if (this.player && !this.player.routes) {
-      this.player.routes = [];
+    // Ensure new fields exist (backwards compatibility)
+    if (this.player) {
+      if (!this.player.routes) this.player.routes = [];
+      if (this.player.heat === undefined) this.player.heat = 0;
+      if (!this.player.poiInvestments) this.player.poiInvestments = {};
     }
 
     // Load pending route requests from storage
@@ -126,6 +204,12 @@ export class PlayerDO implements DurableObject {
       case 'cancel_order':
         await this.handleCancelOrder(ws, msg.orderId);
         break;
+      case 'invest_poi':
+        await this.handleInvestPoi(ws, msg.poiId, msg.amount);
+        break;
+      case 'upgrade_route':
+        await this.handleUpgradeRoute(ws, msg.routeId);
+        break;
     }
   }
 
@@ -158,9 +242,11 @@ export class PlayerDO implements DurableObject {
         country: region.country,
         createdAt: Date.now(),
         routes: [],
+        heat: 0,
+        poiInvestments: {},
       };
       await this.state.storage.put('player', this.player);
-      await this.state.storage.setAlarm(Date.now() + 10000);
+      await this.state.storage.setAlarm(Date.now() + TICK_INTERVAL);
     }
 
     this.send(ws, { type: 'connected', username: this.player.username });
@@ -385,15 +471,21 @@ export class PlayerDO implements DurableObject {
           existingRoute.playerA, existingRoute.playerB
         ]);
 
+        const poiState: IntersectionState = {
+          id: intersectionId,
+          coordinates: intersection,
+          routes: [newRoute.id, existingRoute.id],
+          custody: Array.from(players),
+          investments: {},
+          controller: null,
+          totalInvested: 0,
+          lastActivity: Date.now(),
+          createdAt: Date.now(),
+        };
+
         await intersectionDO.fetch(new Request('http://internal/create', {
           method: 'POST',
-          body: JSON.stringify({
-            id: intersectionId,
-            coordinates: intersection,
-            routes: [newRoute.id, existingRoute.id],
-            custody: Array.from(players),
-            createdAt: Date.now(),
-          }),
+          body: JSON.stringify(poiState),
           headers: { 'Content-Type': 'application/json' },
         }));
 
@@ -401,10 +493,100 @@ export class PlayerDO implements DurableObject {
         for (const player of players) {
           const playerId = this.env.PLAYER.idFromName(player);
           const playerDO = this.env.PLAYER.get(playerId);
-          // Would need a notification endpoint for this
+          // Broadcast intersection created to connected players
+          await playerDO.fetch(new Request('http://internal/intersection-created', {
+            method: 'POST',
+            body: JSON.stringify(poiState),
+            headers: { 'Content-Type': 'application/json' },
+          }));
         }
       }
     }
+  }
+
+  private async handleInvestPoi(ws: WebSocket, poiId: string, amount: number): Promise<void> {
+    if (!this.player) {
+      this.send(ws, { type: 'error', message: 'Not authenticated' });
+      return;
+    }
+
+    if (amount <= 0) {
+      this.send(ws, { type: 'error', message: 'Investment amount must be positive' });
+      return;
+    }
+
+    if (this.player.nits < amount) {
+      this.send(ws, { type: 'error', message: 'Insufficient nits' });
+      return;
+    }
+
+    // Deduct nits
+    this.player.nits -= amount;
+
+    // Track investment
+    if (!this.player.poiInvestments[poiId]) {
+      this.player.poiInvestments[poiId] = 0;
+    }
+    this.player.poiInvestments[poiId] += amount;
+
+    // Add heat for investing
+    this.player.heat = Math.min(HEAT_MAX, this.player.heat + HEAT_POI_INVEST);
+
+    await this.state.storage.put('player', this.player);
+
+    // Send investment to POI
+    const poiDOId = this.env.INTERSECTION.idFromName(poiId);
+    const poiDO = this.env.INTERSECTION.get(poiDOId);
+
+    const response = await poiDO.fetch(new Request('http://internal/invest', {
+      method: 'POST',
+      body: JSON.stringify({ player: this.player.username, amount }),
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    if (response.ok) {
+      const poiState = await response.json() as IntersectionState;
+      this.broadcast({ type: 'poi_update', poi: poiState });
+      this.broadcast({ type: 'heat_update', heat: this.player.heat });
+    }
+  }
+
+  private async handleUpgradeRoute(ws: WebSocket, routeId: string): Promise<void> {
+    if (!this.player) {
+      this.send(ws, { type: 'error', message: 'Not authenticated' });
+      return;
+    }
+
+    const upgradeCost = 50;
+    const capacityIncrease = 5;
+
+    if (this.player.nits < upgradeCost) {
+      this.send(ws, { type: 'error', message: `Insufficient nits (need ${upgradeCost})` });
+      return;
+    }
+
+    // Check if player owns this route
+    if (!this.player.routes.includes(routeId)) {
+      this.send(ws, { type: 'error', message: 'Not your route' });
+      return;
+    }
+
+    // Deduct nits and add heat
+    this.player.nits -= upgradeCost;
+    this.player.heat = Math.min(HEAT_MAX, this.player.heat + HEAT_ROUTE_UPGRADE);
+    await this.state.storage.put('player', this.player);
+
+    // Upgrade the route
+    const routeDOId = this.env.ROUTE.idFromName(routeId);
+    const routeDO = this.env.ROUTE.get(routeDOId);
+
+    await routeDO.fetch(new Request('http://internal/upgrade-capacity', {
+      method: 'POST',
+      body: JSON.stringify({ amount: capacityIncrease }),
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    this.broadcast({ type: 'state', player: this.player });
   }
 
   private async handlePlaceOrder(ws: WebSocket, side: 'bid' | 'ask', price: number, amount: number): Promise<void> {
@@ -416,6 +598,12 @@ export class PlayerDO implements DurableObject {
     if (side === 'ask' && this.player.nits < amount) {
       this.send(ws, { type: 'error', message: 'Insufficient nits' });
       return;
+    }
+
+    // Reserve nits for ask orders
+    if (side === 'ask') {
+      this.player.nits -= amount;
+      await this.state.storage.put('player', this.player);
     }
 
     const marketId = this.env.MARKET.idFromName('global');
@@ -435,6 +623,11 @@ export class PlayerDO implements DurableObject {
       }),
       headers: { 'Content-Type': 'application/json' },
     }));
+
+    // Add heat for trading
+    this.player.heat = Math.min(HEAT_MAX, this.player.heat + HEAT_TRADE);
+    await this.state.storage.put('player', this.player);
+    this.broadcast({ type: 'heat_update', heat: this.player.heat });
   }
 
   private async handleCancelOrder(ws: WebSocket, orderId: string): Promise<void> {
@@ -453,15 +646,119 @@ export class PlayerDO implements DurableObject {
     }));
   }
 
+  private async handleUpdateNits(delta: number, reason: string): Promise<Response> {
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+
+    if (this.player) {
+      this.player.nits += delta;
+      if (this.player.nits < 0) this.player.nits = 0;
+      await this.state.storage.put('player', this.player);
+      this.broadcast({ type: 'state', player: this.player });
+    }
+
+    return new Response('OK');
+  }
+
+  private async handleAddHeat(amount: number, reason: string): Promise<Response> {
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+
+    if (this.player) {
+      this.player.heat = Math.min(HEAT_MAX, Math.max(HEAT_MIN, this.player.heat + amount));
+      await this.state.storage.put('player', this.player);
+      this.broadcast({ type: 'heat_update', heat: this.player.heat });
+    }
+
+    return new Response('OK');
+  }
+
+  private async handlePoiControlChanged(poiId: string, isController: boolean): Promise<Response> {
+    if (!this.controlledPois) {
+      this.controlledPois = await this.state.storage.get<string[]>('controlledPois') ?? [];
+    }
+
+    if (isController && !this.controlledPois.includes(poiId)) {
+      this.controlledPois.push(poiId);
+      // Add heat for winning control
+      if (this.player) {
+        this.player.heat = Math.min(HEAT_MAX, this.player.heat + HEAT_POI_WIN);
+        await this.state.storage.put('player', this.player);
+        this.broadcast({ type: 'heat_update', heat: this.player.heat });
+      }
+    } else if (!isController) {
+      this.controlledPois = this.controlledPois.filter(id => id !== poiId);
+    }
+
+    await this.state.storage.put('controlledPois', this.controlledPois);
+    return new Response('OK');
+  }
+
+  private async handleTollReceived(amount: number, fromPoi: string): Promise<Response> {
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+
+    if (this.player) {
+      this.player.nits += amount;
+      await this.state.storage.put('player', this.player);
+      this.broadcast({ type: 'toll_received', amount, fromPoi });
+      this.broadcast({ type: 'state', player: this.player });
+    }
+
+    return new Response('OK');
+  }
+
+  private async getVisibilityInfo(): Promise<Response> {
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
+
+    if (!this.player) {
+      return new Response('Player not found', { status: 404 });
+    }
+
+    const info: VisiblePlayer = {
+      username: this.player.username,
+      coordinates: this.player.coordinates,
+      heat: this.player.heat,
+    };
+
+    // Only reveal nits if heat is very high
+    if (this.player.heat > 75) {
+      info.nits = this.player.nits;
+    }
+
+    return Response.json(info);
+  }
+
   async alarm(): Promise<void> {
+    if (!this.player) {
+      this.player = await this.state.storage.get<PlayerState>('player') ?? null;
+    }
     if (!this.player) return;
 
-    this.player.nits += this.player.productionRate;
+    // Load controlled POIs
+    if (!this.controlledPois) {
+      this.controlledPois = await this.state.storage.get<string[]>('controlledPois') ?? [];
+    }
+
+    // Calculate production with POI bonuses
+    const poiBonus = this.controlledPois.length * POI_PRODUCTION_BONUS;
+    const totalProduction = this.player.productionRate + poiBonus;
+
+    this.player.nits += totalProduction;
+
+    // Decay heat
+    this.player.heat = Math.max(HEAT_MIN, this.player.heat - HEAT_DECAY_PER_TICK);
+
     await this.state.storage.put('player', this.player);
 
-    this.broadcast({ type: 'tick', nits: this.player.nits });
+    this.broadcast({ type: 'tick', nits: this.player.nits, heat: this.player.heat });
 
-    await this.state.storage.setAlarm(Date.now() + 10000);
+    await this.state.storage.setAlarm(Date.now() + TICK_INTERVAL);
   }
 
   private async getState(): Promise<Response> {

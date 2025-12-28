@@ -18,6 +18,7 @@ type viewMode int
 const (
 	viewDashboard viewMode = iota
 	viewRoutes
+	viewPOIs
 	viewMarket
 )
 
@@ -54,16 +55,19 @@ type App struct {
 	intersections    []api.IntersectionState
 	marketBids       []api.MarketOrder
 	marketAsks       []api.MarketOrder
+	controlledPois   []string // POI IDs we control
+	tollsReceived    int      // Total tolls received this session
 
 	// UI state
-	viewMode   viewMode
-	spinner    spinner.Model
-	input      textinput.Model
-	inputMode  string // "", "route", "bid", "ask"
-	width      int
-	height     int
-	err        error
-	statusMsg  string
+	viewMode    viewMode
+	spinner     spinner.Model
+	input       textinput.Model
+	inputMode   string // "", "route", "bid", "ask", "invest"
+	selectedPoi int    // For POI view navigation
+	width       int
+	height      int
+	err         error
+	statusMsg   string
 }
 
 // NewApp creates a new App instance
@@ -192,6 +196,8 @@ func (a *App) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "2":
 		a.viewMode = viewRoutes
 	case "3":
+		a.viewMode = viewPOIs
+	case "4":
 		a.viewMode = viewMarket
 
 	case "r":
@@ -215,15 +221,42 @@ func (a *App) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "b":
 		if a.viewMode == viewMarket {
 			a.inputMode = "bid"
-			a.input.Placeholder = "Enter price amount (e.g., 10 50)..."
+			a.input.Placeholder = "Enter price amount (e.g., 1.0 50)..."
 			a.input.Focus()
 		}
 
 	case "s":
 		if a.viewMode == viewMarket {
 			a.inputMode = "ask"
-			a.input.Placeholder = "Enter price amount (e.g., 10 50)..."
+			a.input.Placeholder = "Enter price amount (e.g., 1.0 50)..."
 			a.input.Focus()
+		}
+
+	case "i":
+		if a.viewMode == viewPOIs && len(a.intersections) > 0 {
+			a.inputMode = "invest"
+			a.input.Placeholder = "Enter amount to invest..."
+			a.input.Focus()
+		}
+
+	case "j", "down":
+		if a.viewMode == viewPOIs && len(a.intersections) > 0 {
+			a.selectedPoi = (a.selectedPoi + 1) % len(a.intersections)
+		}
+
+	case "k", "up":
+		if a.viewMode == viewPOIs && len(a.intersections) > 0 {
+			a.selectedPoi = (a.selectedPoi - 1 + len(a.intersections)) % len(a.intersections)
+		}
+
+	case "u":
+		// Upgrade selected route
+		if a.viewMode == viewRoutes && len(a.routes) > 0 {
+			route := a.routes[0] // TODO: add route selection
+			return a, func() tea.Msg {
+				a.client.UpgradeRoute(route.Id)
+				return nil
+			}
 		}
 	}
 
@@ -252,6 +285,17 @@ func (a *App) handleInputSubmit(mode, value string) tea.Cmd {
 				return nil
 			}
 		}
+	case "invest":
+		var amount int
+		_, err := fmt.Sscanf(value, "%d", &amount)
+		if err == nil && amount > 0 && len(a.intersections) > 0 {
+			poi := a.intersections[a.selectedPoi]
+			a.statusMsg = fmt.Sprintf("Investing %d nits in POI...", amount)
+			return func() tea.Msg {
+				a.client.InvestPoi(poi.Id, amount)
+				return nil
+			}
+		}
 	}
 	return nil
 }
@@ -272,6 +316,13 @@ func (a *App) handleServerMessage(msg api.ServerMessage) (tea.Model, tea.Cmd) {
 	case "tick":
 		if a.player != nil {
 			a.player.Nits = msg.Nits
+			a.player.Heat = msg.Heat
+		}
+		return a, a.listenForMessages()
+
+	case "heat_update":
+		if a.player != nil {
+			a.player.Heat = msg.Heat
 		}
 		return a, a.listenForMessages()
 
@@ -298,8 +349,44 @@ func (a *App) handleServerMessage(msg api.ServerMessage) (tea.Model, tea.Cmd) {
 	case "intersection_created":
 		if msg.Intersection != nil {
 			a.intersections = append(a.intersections, *msg.Intersection)
-			a.statusMsg = "New intersection created!"
+			a.statusMsg = "New POI created!"
 		}
+		return a, a.listenForMessages()
+
+	case "poi_update":
+		if msg.Poi != nil {
+			// Update existing POI or add new one
+			found := false
+			for i, poi := range a.intersections {
+				if poi.Id == msg.Poi.Id {
+					a.intersections[i] = *msg.Poi
+					found = true
+					break
+				}
+			}
+			if !found {
+				a.intersections = append(a.intersections, *msg.Poi)
+			}
+
+			// Check if we control this POI
+			if a.player != nil && msg.Poi.Controller == a.player.Username {
+				if !contains(a.controlledPois, msg.Poi.Id) {
+					a.controlledPois = append(a.controlledPois, msg.Poi.Id)
+					a.statusMsg = "You now control a POI!"
+				}
+			} else {
+				a.controlledPois = remove(a.controlledPois, msg.Poi.Id)
+			}
+		}
+		return a, a.listenForMessages()
+
+	case "poi_contest":
+		a.statusMsg = fmt.Sprintf("POI contested by %s!", msg.Attacker)
+		return a, a.listenForMessages()
+
+	case "toll_received":
+		a.tollsReceived += msg.Amount
+		a.statusMsg = fmt.Sprintf("Received %d nits in tolls!", msg.Amount)
 		return a, a.listenForMessages()
 
 	case "market_update":
@@ -357,6 +444,8 @@ func (a *App) renderConnected() string {
 		b.WriteString(a.renderDashboard())
 	case viewRoutes:
 		b.WriteString(a.renderRoutesView())
+	case viewPOIs:
+		b.WriteString(a.renderPOIsView())
 	case viewMarket:
 		b.WriteString(a.renderMarketView())
 	}
@@ -381,7 +470,7 @@ func (a *App) renderConnected() string {
 }
 
 func (a *App) renderHeader() string {
-	tabs := []string{"[1]Dashboard", "[2]Routes", "[3]Market"}
+	tabs := []string{"[1]Dashboard", "[2]Routes", "[3]POIs", "[4]Market"}
 	active := int(a.viewMode)
 
 	var rendered []string
@@ -409,11 +498,17 @@ func (a *App) renderDashboard() string {
 	// Player info box
 	nitColor := NitBrightness(a.player.Nits)
 	nitStyle := lipgloss.NewStyle().Bold(true).Foreground(nitColor)
+	heatColor := HeatColor(a.player.Heat)
+	heatStyle := lipgloss.NewStyle().Foreground(heatColor)
 
 	location := fmt.Sprintf("%s, %s", a.player.City, a.player.Region)
 	if a.player.City == "Unknown" {
 		location = formatCoords(a.player.Coordinates.Lat, a.player.Coordinates.Lng)
 	}
+
+	// Calculate production bonus
+	poiBonus := float64(len(a.controlledPois)) * 0.5
+	totalProd := float64(a.player.ProductionRate) + poiBonus
 
 	playerBox := BoxStyle.Render(
 		lipgloss.JoinVertical(lipgloss.Left,
@@ -421,7 +516,9 @@ func (a *App) renderDashboard() string {
 			"",
 			fmt.Sprintf("  %s %s", ConnectedStyle.Render("●"), a.player.Username),
 			fmt.Sprintf("  %s", nitStyle.Render(fmt.Sprintf("%d nits", a.player.Nits))),
-			fmt.Sprintf("  +%d/tick", a.player.ProductionRate),
+			fmt.Sprintf("  +%.1f/tick", totalProd),
+			"",
+			fmt.Sprintf("  %s %s", heatStyle.Render(HeatBar(a.player.Heat)), heatStyle.Render(fmt.Sprintf("%d%%", a.player.Heat))),
 			"",
 			fmt.Sprintf("  %s", DimStyle.Render(location)),
 		),
@@ -442,11 +539,17 @@ func (a *App) renderDashboard() string {
 	)
 
 	// POIs summary
+	poiStatus := fmt.Sprintf("%d POIs", len(a.intersections))
+	if len(a.controlledPois) > 0 {
+		poiStatus += fmt.Sprintf(" (%d controlled)", len(a.controlledPois))
+	}
+
 	poisBox := BoxStyle.Render(
 		lipgloss.JoinVertical(lipgloss.Left,
 			LabelStyle.Render("POIs"),
 			"",
-			fmt.Sprintf("  %d intersections", len(a.intersections)),
+			fmt.Sprintf("  %s", poiStatus),
+			fmt.Sprintf("  %s", DimStyle.Render(fmt.Sprintf("Tolls: %d", a.tollsReceived))),
 		),
 	)
 
@@ -489,6 +592,72 @@ func (a *App) renderRoutesView() string {
 	return b.String()
 }
 
+func (a *App) renderPOIsView() string {
+	var b strings.Builder
+
+	b.WriteString(LabelStyle.Render("POINTS OF INTEREST"))
+	b.WriteString("\n\n")
+
+	if len(a.intersections) == 0 {
+		b.WriteString(DimStyle.Render("  No POIs discovered"))
+		b.WriteString("\n")
+		b.WriteString(DimStyle.Render("  POIs appear when routes cross"))
+	} else {
+		for i, poi := range a.intersections {
+			// Selection indicator
+			selector := "  "
+			if i == a.selectedPoi {
+				selector = "> "
+			}
+
+			// Controller status
+			var statusStyle lipgloss.Style
+			controllerText := "unclaimed"
+			if poi.Controller != "" {
+				if a.player != nil && poi.Controller == a.player.Username {
+					statusStyle = PoiControlledStyle
+					controllerText = "YOU"
+				} else {
+					statusStyle = PoiContestedStyle
+					controllerText = poi.Controller
+				}
+			} else {
+				statusStyle = PoiUnclaimedStyle
+			}
+
+			// Investment info
+			myInvestment := 0
+			if a.player != nil {
+				if inv, ok := poi.Investments[a.player.Username]; ok {
+					myInvestment = inv
+				}
+			}
+
+			coords := formatCoords(poi.Coordinates.Lat, poi.Coordinates.Lng)
+			b.WriteString(fmt.Sprintf("%s%s %s (%s)\n",
+				selector,
+				statusStyle.Render("◆"),
+				coords,
+				statusStyle.Render(controllerText)))
+
+			if i == a.selectedPoi {
+				b.WriteString(fmt.Sprintf("    Total: %d nits | Your stake: %d\n", poi.TotalInvested, myInvestment))
+				if len(poi.Investments) > 0 {
+					b.WriteString("    Stakes: ")
+					stakes := []string{}
+					for player, amount := range poi.Investments {
+						stakes = append(stakes, fmt.Sprintf("%s:%d", player, amount))
+					}
+					b.WriteString(strings.Join(stakes, ", "))
+					b.WriteString("\n")
+				}
+			}
+		}
+	}
+
+	return b.String()
+}
+
 func (a *App) renderMarketView() string {
 	var b strings.Builder
 
@@ -524,11 +693,13 @@ func (a *App) renderHelp() string {
 	var help string
 	switch a.viewMode {
 	case viewDashboard:
-		help = "1-3: views | r: request route | q: quit"
+		help = "1-4: views | r: request route | q: quit"
 	case viewRoutes:
-		help = "1-3: views | r: request route | a: accept | q: quit"
+		help = "1-4: views | r: request route | a: accept | u: upgrade | q: quit"
+	case viewPOIs:
+		help = "1-4: views | j/k: navigate | i: invest | q: quit"
 	case viewMarket:
-		help = "1-3: views | b: bid | s: sell | q: quit"
+		help = "1-4: views | b: bid | s: sell | q: quit"
 	}
 	return HelpStyle.Render(help)
 }
@@ -543,4 +714,24 @@ func formatCoords(lat, lng float64) string {
 		lngDir = "W"
 	}
 	return fmt.Sprintf("%.2f°%s, %.2f°%s", math.Abs(lat), latDir, math.Abs(lng), lngDir)
+}
+
+// Helper functions
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func remove(slice []string, item string) []string {
+	result := []string{}
+	for _, s := range slice {
+		if s != item {
+			result = append(result, s)
+		}
+	}
+	return result
 }

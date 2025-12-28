@@ -17,6 +17,12 @@ var (
 	ColorSuccess = lipgloss.Color("#00FF88")
 	ColorWarning = lipgloss.Color("#FFAA00")
 	ColorDanger  = lipgloss.Color("#FF4444")
+
+	// Heat colors (cool to hot)
+	ColorCool    = lipgloss.Color("#4488FF") // Blue - low heat
+	ColorWarm    = lipgloss.Color("#FFAA00") // Orange - medium heat
+	ColorHot     = lipgloss.Color("#FF4444") // Red - high heat
+	ColorBurning = lipgloss.Color("#FF00FF") // Magenta - max heat
 )
 
 // Styles
@@ -81,6 +87,17 @@ var (
 	// Help text
 	HelpStyle = lipgloss.NewStyle().
 			Foreground(ColorDim)
+
+	// POI styles
+	PoiControlledStyle = lipgloss.NewStyle().
+			Foreground(ColorSuccess).
+			Bold(true)
+
+	PoiContestedStyle = lipgloss.NewStyle().
+			Foreground(ColorWarning)
+
+	PoiUnclaimedStyle = lipgloss.NewStyle().
+			Foreground(ColorDim)
 )
 
 // NitBrightness returns a color based on nit count (more nits = brighter)
@@ -95,4 +112,37 @@ func NitBrightness(nits int) lipgloss.Color {
 	default:
 		return ColorGlow
 	}
+}
+
+// HeatColor returns a color based on heat level (0-100)
+func HeatColor(heat int) lipgloss.Color {
+	switch {
+	case heat < 25:
+		return ColorCool
+	case heat < 50:
+		return ColorWarm
+	case heat < 75:
+		return ColorHot
+	default:
+		return ColorBurning
+	}
+}
+
+// HeatBar returns a visual representation of heat level
+func HeatBar(heat int) string {
+	const barWidth = 10
+	filled := heat * barWidth / 100
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	bar := ""
+	for i := 0; i < barWidth; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+	return bar
 }

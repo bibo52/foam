@@ -10,9 +10,14 @@ bindings = [
   { name = "PLAYER", class_name = "PlayerDO" },
   { name = "ROUTE", class_name = "RouteDO" },
   { name = "INTERSECTION", class_name = "IntersectionDO" },
-  { name = "MARKET", class_name = "MarketDO" }
+  { name = "MARKET", class_name = "MarketDO" },
+  { name = "BOT", class_name = "BotDO" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["PlayerDO", "RouteDO", "IntersectionDO", "MarketDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["BotDO"]

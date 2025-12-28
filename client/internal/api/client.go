@@ -11,34 +11,43 @@ import (
 
 // ServerMessage types from the server
 type ServerMessage struct {
-	Type         string            `json:"type"`
-	Username     string            `json:"username,omitempty"`
-	Player       *PlayerState      `json:"player,omitempty"`
-	Nits         int               `json:"nits,omitempty"`
-	Message      string            `json:"message,omitempty"`
-	From         string            `json:"from,omitempty"`
-	RouteId      string            `json:"routeId,omitempty"`
-	Route        *RouteState       `json:"route,omitempty"`
-	Routes       []RouteState      `json:"routes,omitempty"`
+	Type         string             `json:"type"`
+	Username     string             `json:"username,omitempty"`
+	Player       *PlayerState       `json:"player,omitempty"`
+	Nits         int                `json:"nits,omitempty"`
+	Heat         int                `json:"heat,omitempty"`
+	Message      string             `json:"message,omitempty"`
+	From         string             `json:"from,omitempty"`
+	RouteId      string             `json:"routeId,omitempty"`
+	Route        *RouteState        `json:"route,omitempty"`
+	Routes       []RouteState       `json:"routes,omitempty"`
 	Intersection *IntersectionState `json:"intersection,omitempty"`
-	Bids         []MarketOrder     `json:"bids,omitempty"`
-	Asks         []MarketOrder     `json:"asks,omitempty"`
-	OrderId      string            `json:"orderId,omitempty"`
-	Amount       int               `json:"amount,omitempty"`
-	Price        float64           `json:"price,omitempty"`
+	Poi          *IntersectionState `json:"poi,omitempty"`
+	Bids         []MarketOrder      `json:"bids,omitempty"`
+	Asks         []MarketOrder      `json:"asks,omitempty"`
+	OrderId      string             `json:"orderId,omitempty"`
+	Amount       int                `json:"amount,omitempty"`
+	Price        float64            `json:"price,omitempty"`
+	FromPoi      string             `json:"fromPoi,omitempty"`
+	PoiId        string             `json:"poiId,omitempty"`
+	Attacker     string             `json:"attacker,omitempty"`
+	NewController string            `json:"newController,omitempty"`
+	VisiblePlayers []VisiblePlayer  `json:"visiblePlayers,omitempty"`
 }
 
 // PlayerState from the server
 type PlayerState struct {
-	Username       string      `json:"username"`
-	Nits           int         `json:"nits"`
-	ProductionRate int         `json:"productionRate"`
-	Coordinates    Coordinates `json:"coordinates"`
-	City           string      `json:"city"`
-	Region         string      `json:"region"`
-	Country        string      `json:"country"`
-	CreatedAt      int64       `json:"createdAt"`
-	Routes         []string    `json:"routes"`
+	Username       string             `json:"username"`
+	Nits           int                `json:"nits"`
+	ProductionRate int                `json:"productionRate"`
+	Coordinates    Coordinates        `json:"coordinates"`
+	City           string             `json:"city"`
+	Region         string             `json:"region"`
+	Country        string             `json:"country"`
+	CreatedAt      int64              `json:"createdAt"`
+	Routes         []string           `json:"routes"`
+	Heat           int                `json:"heat"`
+	PoiInvestments map[string]int     `json:"poiInvestments"`
 }
 
 // Coordinates for geographic position
@@ -61,11 +70,23 @@ type RouteState struct {
 
 // IntersectionState from the server
 type IntersectionState struct {
-	Id          string      `json:"id"`
+	Id            string         `json:"id"`
+	Coordinates   Coordinates    `json:"coordinates"`
+	Routes        []string       `json:"routes"`
+	Custody       []string       `json:"custody"`
+	Investments   map[string]int `json:"investments"`
+	Controller    string         `json:"controller"`
+	TotalInvested int            `json:"totalInvested"`
+	LastActivity  int64          `json:"lastActivity"`
+	CreatedAt     int64          `json:"createdAt"`
+}
+
+// VisiblePlayer for fog of war
+type VisiblePlayer struct {
+	Username    string      `json:"username"`
 	Coordinates Coordinates `json:"coordinates"`
-	Routes      []string    `json:"routes"`
-	Custody     []string    `json:"custody"`
-	CreatedAt   int64       `json:"createdAt"`
+	Heat        int         `json:"heat"`
+	Nits        int         `json:"nits,omitempty"`
 }
 
 // MarketOrder from the server
@@ -88,6 +109,7 @@ type ClientMessage struct {
 	Price    float64 `json:"price,omitempty"`
 	Amount   int     `json:"amount,omitempty"`
 	OrderId  string  `json:"orderId,omitempty"`
+	PoiId    string  `json:"poiId,omitempty"`
 }
 
 // Client handles WebSocket communication with the foam server
@@ -192,6 +214,23 @@ func (c *Client) CancelOrder(orderId string) error {
 	return c.Send(ClientMessage{
 		Type:    "cancel_order",
 		OrderId: orderId,
+	})
+}
+
+// InvestPoi invests nits in a POI
+func (c *Client) InvestPoi(poiId string, amount int) error {
+	return c.Send(ClientMessage{
+		Type:   "invest_poi",
+		PoiId:  poiId,
+		Amount: amount,
+	})
+}
+
+// UpgradeRoute upgrades a route's capacity
+func (c *Client) UpgradeRoute(routeId string) error {
+	return c.Send(ClientMessage{
+		Type:    "upgrade_route",
+		RouteId: routeId,
 	})
 }
 
